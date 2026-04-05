@@ -1,0 +1,5 @@
+{
+  "name": "Capstone Trading Terminal",
+  "description": "Professional-grade live trading platform with MT5 bridge integration, real-time pattern recognition, and advanced market analytics.",
+  "requestFramePermissions": []
+}
