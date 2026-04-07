@@ -116,6 +116,16 @@ interface Pattern {
   status: 'confirmed' | 'forming' | 'detected';
 }
 
+interface Drawing {
+  id: string;
+  type: 'line' | 'rect' | 'fib' | 'brush' | 'text';
+  points: { x: number; y: number }[];
+  color: string;
+  thickness: number;
+  style: 'solid' | 'dashed' | 'dotted';
+  label?: string;
+}
+
 interface Trade {
   id: string;
   symbol: string;
@@ -214,8 +224,8 @@ const ConnectionBadge = ({ label, status, detail }: { label: string; status: 'co
   </div>
 );
 
-const GlassCard = ({ children, className, key }: { children: React.ReactNode; className?: string; key?: React.Key }) => (
-  <div key={key} className={cn("bg-[#1e222d] border border-[#2a2e39]", className)}>
+const GlassCard = ({ children, className }: { children: React.ReactNode; className?: string; key?: React.Key }) => (
+  <div className={cn("bg-[#1e222d] border border-[#2a2e39]", className)}>
     {children}
   </div>
 );
@@ -318,10 +328,12 @@ export default function App() {
     localStorage.setItem('nextrade_timeframe', timeframe);
   }, [timeframe]);
   const [zoom, setZoom] = useState(30);
-  const [drawings, setDrawings] = useState<{ id: string; type: 'line' | 'rect'; points: any[]; label?: string }[]>([]);
+  const [drawings, setDrawings] = useState<Drawing[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
-  const [drawingType, setDrawingType] = useState<'line' | 'rect'>('line');
-  const [selectedDrawing, setSelectedDrawing] = useState<string | null>(null);
+  const [drawingType, setDrawingType] = useState<'line' | 'rect' | 'fib' | 'brush' | 'text'>('line');
+  const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
+  const [showDrawingSettings, setShowDrawingSettings] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; drawingId: string } | null>(null);
   const [uiScale, setUiScale] = useState(1);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [user, setUser] = useState<any>(null);
@@ -340,6 +352,79 @@ export default function App() {
   const [showChartMenu, setShowChartMenu] = useState(false);
   const [showToolsMenu, setShowToolsMenu] = useState(false);
   const [dragInfo, setDragInfo] = useState<{ id: string; startX: number; startY: number; initialPoints: any[] } | null>(null);
+  const handleChartMouseDown = (e: React.MouseEvent) => {
+    if (!selectedDrawingTool || selectedDrawingTool === 'cursor') return;
+    if (!chartRef.current) return;
+
+    const rect = chartRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    setIsDrawing(true);
+    const newDrawing: Drawing = {
+      id: Math.random().toString(36).substr(2, 9),
+      type: drawingType,
+      points: [{ x, y }, { x, y }],
+      color: '#2962ff',
+      thickness: 1,
+      style: 'solid'
+    };
+    setDrawings(prev => [...prev, newDrawing]);
+    setSelectedDrawingId(newDrawing.id);
+  };
+
+  const handleChartMouseMove = (e: React.MouseEvent) => {
+    if (!isDrawing || !chartRef.current) return;
+
+    const rect = chartRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    setDrawings(prev => prev.map(d => {
+      if (d.id === selectedDrawingId) {
+        if (d.type === 'brush') {
+          return { ...d, points: [...d.points, { x, y }] };
+        }
+        return { ...d, points: [d.points[0], { x, y }] };
+      }
+      return d;
+    }));
+  };
+
+  const handleChartMouseUp = () => {
+    setIsDrawing(false);
+    if (selectedDrawingTool !== 'brush') {
+      setSelectedDrawingTool('cursor');
+    }
+  };
+
+  const handleDrawingDoubleClick = (e: React.MouseEvent, drawing: Drawing) => {
+    e.stopPropagation();
+    setSelectedDrawingId(drawing.id);
+    setShowDrawingSettings(true);
+  };
+
+  const handleDrawingContextMenu = (e: React.MouseEvent, drawing: Drawing) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, drawingId: drawing.id });
+  };
+
+  const updateDrawing = (id: string, updates: Partial<Drawing>) => {
+    setDrawings(prev => prev.map(d => d.id === id ? { ...d, ...updates } : d));
+  };
+
+  const deleteDrawing = (id: string) => {
+    setDrawings(prev => prev.filter(d => d.id !== id));
+    setContextMenu(null);
+  };
+
+  useEffect(() => {
+    const handleClickOutside = () => setContextMenu(null);
+    window.addEventListener('click', handleClickOutside);
+    return () => window.removeEventListener('click', handleClickOutside);
+  }, []);
+
   const [trades, setTrades] = useState<Trade[]>([]);
   const [signals, setSignals] = useState<Signal[]>([
     { id: '1', type: 'BUY', symbol: 'EUR/USD', price: 1.09250, sl: 1.09150, tp: 1.09550, confidence: 94, time: '15m' },
@@ -836,7 +921,7 @@ export default function App() {
   }, [prices]);
 
   useEffect(() => {
-    setSelectedDrawing(null);
+    setSelectedDrawingId(null);
     setIsDrawing(false);
   }, [activeSymbol]);
 
@@ -982,6 +1067,33 @@ export default function App() {
             ))}
           </div>
 
+          <div className="flex items-center h-full px-4 gap-4 border-r border-[#2a2e39]">
+            {[
+              { id: 'Trading', icon: TrendingUp },
+              { id: 'Portfolio', icon: Briefcase },
+              { id: 'Analytics', icon: BarChart2 },
+              { id: 'Signals', icon: Bell }
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "text-[13px] font-bold transition-colors relative h-full flex items-center gap-1.5 px-1",
+                  activeTab === tab.id ? "text-[#2962ff]" : "text-[#868993] hover:text-[#d1d4dc]"
+                )}
+              >
+                <tab.icon size={14} />
+                {tab.id}
+                {activeTab === tab.id && (
+                  <motion.div 
+                    layoutId="activeTab"
+                    className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#2962ff]"
+                  />
+                )}
+              </button>
+            ))}
+          </div>
+
           <div className="flex items-center h-full px-1 border-r border-[#2a2e39]">
             <TVIconButton 
               icon={ChartCandlestick} 
@@ -1052,25 +1164,46 @@ export default function App() {
           <TVIconButton 
             icon={TrendingUp} 
             active={selectedDrawingTool === 'line'} 
-            onClick={() => setSelectedDrawingTool('line')}
+            onClick={() => {
+              setSelectedDrawingTool('line');
+              setDrawingType('line');
+            }}
             title="Trend Line"
           />
           <TVIconButton 
             icon={PenTool} 
-            active={selectedDrawingTool === 'pen'} 
-            onClick={() => setSelectedDrawingTool('pen')}
-            title="Pen"
+            active={selectedDrawingTool === 'rect'} 
+            onClick={() => {
+              setSelectedDrawingTool('rect');
+              setDrawingType('rect');
+            }}
+            title="Rectangle"
+          />
+          <TVIconButton 
+            icon={LayoutGrid} 
+            active={selectedDrawingTool === 'fib'} 
+            onClick={() => {
+              setSelectedDrawingTool('fib');
+              setDrawingType('fib');
+            }}
+            title="Fibonacci Retracement"
           />
           <TVIconButton 
             icon={Brush} 
             active={selectedDrawingTool === 'brush'} 
-            onClick={() => setSelectedDrawingTool('brush')}
+            onClick={() => {
+              setSelectedDrawingTool('brush');
+              setDrawingType('brush');
+            }}
             title="Brush"
           />
           <TVIconButton 
             icon={Type} 
             active={selectedDrawingTool === 'text'} 
-            onClick={() => setSelectedDrawingTool('text')}
+            onClick={() => {
+              setSelectedDrawingTool('text');
+              setDrawingType('text');
+            }}
             title="Text"
           />
           <TVIconButton 
@@ -1082,6 +1215,12 @@ export default function App() {
           <div className="w-6 h-[1px] bg-[#2a2e39] my-2" />
           <TVIconButton icon={Ruler} title="Measure" />
           <TVIconButton icon={ZoomIn} title="Zoom In" />
+          <TVIconButton 
+            icon={Briefcase} 
+            active={activeTab === 'Portfolio'} 
+            onClick={() => setActiveTab('Portfolio')} 
+            title="Portfolio"
+          />
           <div className="flex-1" />
           <TVIconButton 
             icon={Magnet} 
