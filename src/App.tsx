@@ -321,6 +321,7 @@ export default function App() {
   });
   const tickBuffer = useRef<Record<string, number>>({});
   const historyBuffer = useRef<Record<string, CandleData[]>>({});
+  const chartRef = useRef<HTMLDivElement>(null);
   const [chartType, setChartType] = useState<'line' | 'candle'>('candle');
   const [activeTab, setActiveTab] = useState('Trading');
   const [timeframe, setTimeframe] = useState(() => localStorage.getItem('nextrade_timeframe') || '15m');
@@ -469,7 +470,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!isLoggedIn) return;
+    if (!isLoggedIn) {
+      setTrades([]);
+      setSupabaseStatus('disconnected');
+      setWsStatus('disconnected');
+      return;
+    }
 
     // 1. Initial Data Fetch from Supabase
     const fetchData = async () => {
@@ -597,8 +603,9 @@ export default function App() {
       ws.current?.close();
       supabase.removeChannel(signalsSubscription);
       supabase.removeChannel(patternsSubscription);
+      supabase.removeChannel(tradesSubscription);
     };
-  }, [timeframe]);
+  }, [isLoggedIn, timeframe, user?.id]);
 
   // Handle click outside for menus
   useEffect(() => {
@@ -865,6 +872,9 @@ export default function App() {
   };
 
   const handleCloseTrade = async (tradeId: string) => {
+    // Optimistic update
+    setTrades(prev => prev.map(t => t.id === tradeId ? { ...t, status: 'CLOSED' } : t));
+
     try {
       const { error } = await supabase
         .from('trades')
@@ -874,47 +884,95 @@ export default function App() {
       if (error) throw error;
       toast.success('Trade closed successfully');
     } catch (error: any) {
+      // Revert optimistic update on error
+      const { data } = await supabase.from('trades').select('*').eq('id', tradeId).single();
+      if (data) {
+        setTrades(prev => prev.map(t => t.id === tradeId ? data as Trade : t));
+      }
       toast.error(`Failed to close trade: ${error.message}`);
+    }
+  };
+
+  const handleCloseAllTrades = async () => {
+    const openTrades = trades.filter(t => t.status === 'OPEN');
+    if (openTrades.length === 0) return;
+
+    // Optimistic update
+    setTrades(prev => prev.map(t => t.status === 'OPEN' ? { ...t, status: 'CLOSED' } : t));
+
+    try {
+      const { error } = await supabase
+        .from('trades')
+        .update({ status: 'CLOSED' })
+        .in('id', openTrades.map(t => t.id));
+
+      if (error) throw error;
+      toast.success(`Closed ${openTrades.length} positions`);
+    } catch (error: any) {
+      // Revert optimistic update on error
+      const { data } = await supabase.from('trades').select('*').in('id', openTrades.map(t => t.id));
+      if (data) {
+        setTrades(prev => {
+          const updatedMap = new Map(data.map(t => [t.id, t]));
+          return prev.map(t => updatedMap.has(t.id) ? updatedMap.get(t.id) as Trade : t);
+        });
+      }
+      toast.error(`Failed to close all trades: ${error.message}`);
     }
   };
 
   useEffect(() => {
     // Throttle trade updates to avoid excessive re-renders
     const timer = setInterval(() => {
-      setTrades(prev => prev.map(trade => {
-        if (trade.status === 'OPEN') {
-          const currentPrice = prices[trade.symbol] || trade.entry_price;
-          const diff = trade.type === 'BUY' ? currentPrice - trade.entry_price : trade.entry_price - currentPrice;
-          
-          let multiplier = 100000;
-          if (trade.symbol.includes('JPY')) multiplier = 1000;
-          if (trade.symbol === 'XAU/USD') multiplier = 100;
-          if (trade.symbol === 'BTC/USD') multiplier = 1;
-          
-          // Check SL/TP
-          let status = trade.status;
-          if (trade.sl) {
-            if (trade.type === 'BUY' && currentPrice <= trade.sl) status = 'CLOSED';
-            if (trade.type === 'SELL' && currentPrice >= trade.sl) status = 'CLOSED';
-          }
-          if (trade.tp) {
-            if (trade.type === 'BUY' && currentPrice >= trade.tp) status = 'CLOSED';
-            if (trade.type === 'SELL' && currentPrice <= trade.tp) status = 'CLOSED';
-          }
+      setTrades(prev => {
+        const newlyClosed: string[] = [];
+        const next = prev.map(trade => {
+          if (trade.status === 'OPEN') {
+            const currentPrice = prices[trade.symbol] || trade.entry_price;
+            const diff = trade.type === 'BUY' ? currentPrice - trade.entry_price : trade.entry_price - currentPrice;
+            
+            let multiplier = 100000;
+            if (trade.symbol.includes('JPY')) multiplier = 1000;
+            if (trade.symbol === 'XAU/USD') multiplier = 100;
+            if (trade.symbol === 'BTC/USD') multiplier = 1;
+            
+            // Check SL/TP
+            let status = trade.status;
+            if (trade.sl) {
+              if (trade.type === 'BUY' && currentPrice <= trade.sl) status = 'CLOSED';
+              if (trade.type === 'SELL' && currentPrice >= trade.sl) status = 'CLOSED';
+            }
+            if (trade.tp) {
+              if (trade.type === 'BUY' && currentPrice >= trade.tp) status = 'CLOSED';
+              if (trade.type === 'SELL' && currentPrice <= trade.tp) status = 'CLOSED';
+            }
 
-          if (status === 'CLOSED' && trade.status === 'OPEN') {
-            toast.info(`${trade.symbol} trade closed at ${status === 'CLOSED' ? (trade.sl ? 'SL' : 'TP') : 'Market'}`);
-          }
+            if (status === 'CLOSED' && trade.status === 'OPEN') {
+              newlyClosed.push(trade.id);
+              toast.info(`${trade.symbol} trade closed at ${trade.sl && currentPrice <= trade.sl ? 'SL' : 'TP'}`);
+            }
 
-          return {
-            ...trade,
-            currentPrice,
-            profit: diff * trade.lot_size * multiplier,
-            status
-          };
+            return {
+              ...trade,
+              currentPrice,
+              profit: diff * trade.lot_size * multiplier,
+              status
+            };
+          }
+          return trade;
+        });
+
+        // Trigger Supabase update for newly closed trades
+        if (newlyClosed.length > 0) {
+          newlyClosed.forEach(id => {
+            supabase.from('trades').update({ status: 'CLOSED' }).eq('id', id).then(({ error }) => {
+              if (error) console.error('Failed to sync SL/TP closure:', error);
+            });
+          });
         }
-        return trade;
-      }));
+
+        return next;
+      });
     }, 500);
 
     return () => clearInterval(timer);
@@ -1280,7 +1338,13 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="h-[500px] shrink-0 relative pt-10 bg-white">
+                <div 
+                  ref={chartRef}
+                  onMouseDown={handleChartMouseDown}
+                  onMouseMove={handleChartMouseMove}
+                  onMouseUp={handleChartMouseUp}
+                  className="h-[500px] shrink-0 relative pt-10 bg-white"
+                >
                   <ResponsiveContainer width="100%" height="100%">
                     {chartType === 'line' ? (
                       <AreaChart data={chartData}>
@@ -1647,7 +1711,12 @@ export default function App() {
                         <p className="text-xs text-slate-500">Real-time market exposure and performance</p>
                       </div>
                       <div className="flex gap-2">
-                        <button className="px-3 py-1.5 bg-slate-800 rounded text-[10px] font-bold text-slate-300 hover:text-white">CLOSE ALL</button>
+                        <button 
+                          onClick={handleCloseAllTrades}
+                          className="px-3 py-1.5 bg-slate-800 rounded text-[10px] font-bold text-slate-300 hover:text-white transition-colors"
+                        >
+                          CLOSE ALL
+                        </button>
                       </div>
                     </div>
                     
